@@ -9,6 +9,7 @@ class WindowWatcher {
     private(set) var frontAppBundleID: String?
     private var axObserver: AXObserver?
     private var activeWindow: AXUIElement?
+    private var mouseDownMonitor: Any?
 
     // Require 2 consecutive AX failures before treating as "no active window".
     // This filters out transient errors during minimize animations.
@@ -31,6 +32,16 @@ class WindowWatcher {
             self?.poll()
         }
 
+        mouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            if Thread.isMainThread {
+                self?.handleMouseDown(event)
+            } else {
+                DispatchQueue.main.async {
+                    self?.handleMouseDown(event)
+                }
+            }
+        }
+
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
         }
@@ -38,6 +49,9 @@ class WindowWatcher {
 
     deinit {
         timer?.invalidate()
+        if let mouseDownMonitor = mouseDownMonitor {
+            NSEvent.removeMonitor(mouseDownMonitor)
+        }
         removeAXObserver()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
@@ -98,6 +112,84 @@ class WindowWatcher {
         }
 
         poll()
+    }
+
+    private func handleMouseDown(_ event: NSEvent) {
+        guard activeWindowRect != nil,
+              let activeWindow = activeWindow,
+              let cgEvent = event.cgEvent else {
+            return
+        }
+
+        guard let hitElement = elementAtScreenPosition(cgEvent.location),
+              let minimizeButton = minimizeButtonElement(from: hitElement),
+              let containingWindow = containingWindow(of: minimizeButton),
+              CFEqual(containingWindow, activeWindow) else {
+            return
+        }
+
+        nilStreak = 0
+        activeWindowRect = nil
+        self.activeWindow = nil
+        minimizationGracePeriod = Date().addingTimeInterval(0.4)
+        onChange?(true)
+    }
+
+    private func elementAtScreenPosition(_ position: CGPoint) -> AXUIElement? {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var element: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(position.x), Float(position.y), &element)
+        return result == .success ? element : nil
+    }
+
+    private func minimizeButtonElement(from element: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+
+        for _ in 0..<8 {
+            guard let candidate = current else { return nil }
+
+            if stringAttribute(kAXSubroleAttribute as CFString, of: candidate) == "AXMinimizeButton" {
+                return candidate
+            }
+
+            current = elementAttribute(kAXParentAttribute as CFString, of: candidate)
+        }
+
+        return nil
+    }
+
+    private func containingWindow(of element: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+
+        for _ in 0..<12 {
+            guard let candidate = current else { return nil }
+
+            if stringAttribute(kAXRoleAttribute as CFString, of: candidate) == "AXWindow" {
+                return candidate
+            }
+
+            current = elementAttribute(kAXParentAttribute as CFString, of: candidate)
+        }
+
+        return nil
+    }
+
+    private func stringAttribute(_ attribute: CFString, of element: AXUIElement) -> String? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+
+        return value as? String
+    }
+
+    private func elementAttribute(_ attribute: CFString, of element: AXUIElement) -> AXUIElement? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+
+        return (value as! AXUIElement)
     }
 
     @objc private func appChanged() {
