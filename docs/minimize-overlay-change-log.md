@@ -24,9 +24,12 @@
 
 ## 当前保留下来的核心设计
 
-当前版本只保留一个目标：当前活跃窗口被最小化时，尽快关闭蒙版；非活跃窗口不应该触发即时关闭逻辑。
+当前版本保留两个目标：
 
-实现分为两层：
+1. 当前活跃窗口被最小化时，尽快关闭蒙版。
+2. 非活跃窗口被最小化时，不应该让当前活跃窗口的蒙版闪烁或消失。
+
+活跃窗口最小化的实现分为两层：
 
 1. `AXWindowMiniaturized` 通知兜底。
 2. 鼠标按下黄色最小化按钮时的提前命中检测。
@@ -115,9 +118,28 @@
 - 条件非常窄：必须命中当前活跃窗口的 `AXMinimizeButton`。
 - 点击其他窗口的黄色按钮、非活跃窗口、普通鼠标点击都不会触发即时关闭。
 
+## 已保留修改五：稳定活跃窗口备份
+
+文件：
+
+- `Shade/Sources/Shade/WindowWatcher.swift`
+
+修改内容：
+
+1. 新增 `lastStableActiveWindow`、`lastStableActiveWindowRect`、`lastStableFrontAppBundleID`。
+2. 每次正常 `poll()` 成功读到 focused window 的稳定 rect 后，记录这组三元组。
+3. 如果鼠标按下命中黄色最小化按钮，但该按钮所属窗口不是当前或上一次稳定的活跃窗口，则短暂保留上一次稳定的窗口 rect。
+4. 如果收到 `AXWindowMiniaturized`，但通知元素不是当前或上一次稳定的活跃窗口，也短暂保留上一次稳定的窗口 rect。
+5. `appChanged()` 不再立刻清空活跃窗口，而是把随后的 `poll()` 延迟约 0.06 秒，让同一次鼠标点击的 hit-test 先建立保护状态，避免 A 被系统激活抖动提前覆盖成 B。
+
+作用：
+
+- 当焦点在窗口 A、用户最小化非焦点窗口 B 时，即使 macOS 临时改变 AX focused window 或触发 app activation，蒙版也会先保持在最后稳定确认的 A 上。
+- 这版不同于上一轮无效尝试：保护对象不依赖瞬时 `activeWindow`，而依赖已确认稳定的 `lastStableActiveWindow`。
+
 ## 当前 git 记录
 
-现在项目已经初始化 git，并有两个关键提交：
+现在项目已经初始化 git，并有以下关键提交：
 
 1. `1a5798e Baseline before minimize button hit-test`
 
@@ -125,7 +147,19 @@
 
 2. `4ace623 Close overlay on active minimize button press`
 
-   这是最新功能提交。它只修改了 `WindowWatcher.swift`，增加鼠标按下黄色最小化按钮时的 AX hit-test 逻辑。
+   这是 hit-test 功能提交。它只修改了 `WindowWatcher.swift`，增加鼠标按下黄色最小化按钮时的 AX hit-test 逻辑。
+
+3. `edfd25b Preserve overlay during non-active minimize`
+
+   这是上一轮非活跃窗口保护尝试；后来确认没有效果，已通过 revert 回退。
+
+4. `9bad2b4 Revert "Preserve overlay during non-active minimize"`
+
+   这是对上一轮无效代码尝试的回退提交。
+
+5. `f55d23c Preserve last stable active window during minimize`
+
+   这是当前的 `lastStableActiveWindow` 方案。它保留最后稳定确认的活跃窗口 A，并在非活跃窗口 B 最小化时短暂保持 A 的蒙版状态。
 
 ## 构建与安装验证
 
@@ -174,5 +208,5 @@ open /Applications/Shade.app
 
 1. 点击当前活跃窗口的黄色最小化按钮时，蒙版应在鼠标按下时立即消失。
 2. 如果鼠标 hit-test 没有捕捉到，`AXWindowMiniaturized` 通知仍会作为兜底关闭蒙版。
-3. 非活跃窗口最小化不应触发即时关闭逻辑。
+3. 非活跃窗口最小化不应触发即时关闭逻辑，也不应导致当前活跃窗口的蒙版闪烁或消失。
 4. 原有普通窗口变化仍然保留 debounce，以减少 AX 瞬时状态变化造成的闪烁。
