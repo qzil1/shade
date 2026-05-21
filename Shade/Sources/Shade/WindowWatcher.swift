@@ -19,6 +19,7 @@ class WindowWatcher {
     // After detecting minimization, ignore rect recoveries for 0.4s to avoid
     // flicker caused by unstable AX data during the minimize animation.
     private var minimizationGracePeriod: Date?
+    private var nonActiveMinimizeGraceUntil: Date?
 
     func start() {
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -99,15 +100,19 @@ class WindowWatcher {
     }
 
     private func handleAXNotification(_ notification: String, element: AXUIElement) {
-        if notification == "AXWindowMiniaturized",
-           let activeWindow = activeWindow,
-           activeWindowRect != nil,
-           CFEqual(element, activeWindow) {
-            nilStreak = 0
-            activeWindowRect = nil
-            self.activeWindow = nil
-            minimizationGracePeriod = Date().addingTimeInterval(0.4)
-            onChange?(true)
+        if notification == "AXWindowMiniaturized" {
+            if let activeWindow = activeWindow,
+               activeWindowRect != nil,
+               CFEqual(element, activeWindow) {
+                nilStreak = 0
+                activeWindowRect = nil
+                self.activeWindow = nil
+                minimizationGracePeriod = Date().addingTimeInterval(0.4)
+                onChange?(true)
+                return
+            }
+
+            nonActiveMinimizeGraceUntil = Date().addingTimeInterval(0.45)
             return
         }
 
@@ -116,15 +121,18 @@ class WindowWatcher {
 
     private func handleMouseDown(_ event: NSEvent) {
         guard activeWindowRect != nil,
-              let activeWindow = activeWindow,
               let cgEvent = event.cgEvent else {
             return
         }
 
         guard let hitElement = elementAtScreenPosition(cgEvent.location),
               let minimizeButton = minimizeButtonElement(from: hitElement),
-              let containingWindow = containingWindow(of: minimizeButton),
-              CFEqual(containingWindow, activeWindow) else {
+              let containingWindow = containingWindow(of: minimizeButton) else {
+            return
+        }
+
+        guard let activeWindow = activeWindow, CFEqual(containingWindow, activeWindow) else {
+            nonActiveMinimizeGraceUntil = Date().addingTimeInterval(0.45)
             return
         }
 
@@ -192,9 +200,69 @@ class WindowWatcher {
         return (value as! AXUIElement)
     }
 
+    private func preserveActiveWindowDuringNonActiveMinimize() -> Bool {
+        guard let until = nonActiveMinimizeGraceUntil else {
+            return false
+        }
+
+        if Date() >= until {
+            nonActiveMinimizeGraceUntil = nil
+            return false
+        }
+
+        guard let activeWindow = activeWindow,
+              let currentRect = activeWindowRect else {
+            return false
+        }
+
+        nilStreak = 0
+        guard let rect = visibleRect(for: activeWindow) else {
+            return true
+        }
+
+        if !rect.equalTo(currentRect) {
+            activeWindowRect = rect
+            onChange?(false)
+        }
+        return true
+    }
+
+    private func visibleRect(for window: AXUIElement) -> CGRect? {
+        var minimizedValue: AnyObject?
+        let minimizedResult = AXUIElementCopyAttributeValue(window, "AXMinimized" as CFString, &minimizedValue)
+        if minimizedResult == .success,
+           let minimized = minimizedValue as? NSNumber,
+           minimized.boolValue {
+            return nil
+        }
+
+        var positionValue: AnyObject?
+        var sizeValue: AnyObject?
+
+        let posResult = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue)
+        let sizeResult = AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue)
+
+        guard posResult == .success, sizeResult == .success,
+              let posAX = positionValue, let sizeAX = sizeValue else {
+            return nil
+        }
+
+        var position = CGPoint.zero
+        var size = CGSize.zero
+
+        guard AXValueGetValue(posAX as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeAX as! AXValue, .cgSize, &size) else {
+            return nil
+        }
+
+        let rect = CGRect(origin: position, size: size)
+        return rect.isEmpty ? nil : rect
+    }
+
     @objc private func appChanged() {
         nilStreak = 0
         minimizationGracePeriod = nil
+        nonActiveMinimizeGraceUntil = nil
         activeWindow = nil
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
@@ -219,6 +287,10 @@ class WindowWatcher {
 
         lastFrontApp = frontApp
         frontAppBundleID = frontApp.bundleIdentifier
+
+        if preserveActiveWindowDuringNonActiveMinimize() {
+            return
+        }
 
         let axApp = AXUIElementCreateApplication(pid_t(frontApp.processIdentifier))
         var value: AnyObject?
