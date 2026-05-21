@@ -9,12 +9,7 @@ class WindowWatcher {
     private(set) var frontAppBundleID: String?
     private var axObserver: AXObserver?
     private var activeWindow: AXUIElement?
-    private var mouseEventTap: CFMachPort?
-    private var mouseEventTapSource: CFRunLoopSource?
-    private var protectedActiveWindow: AXUIElement?
-    private var protectedActiveWindowRect: CGRect?
-    private var protectedFrontAppBundleID: String?
-    private var nonActiveMinimizeProtectionUntil: Date?
+    private var mouseDownMonitor: Any?
 
     // Require 2 consecutive AX failures before treating as "no active window".
     // This filters out transient errors during minimize animations.
@@ -37,7 +32,15 @@ class WindowWatcher {
             self?.poll()
         }
 
-        setupMouseEventTap()
+        mouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            if Thread.isMainThread {
+                self?.handleMouseDown(event)
+            } else {
+                DispatchQueue.main.async {
+                    self?.handleMouseDown(event)
+                }
+            }
+        }
 
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
@@ -46,73 +49,11 @@ class WindowWatcher {
 
     deinit {
         timer?.invalidate()
-        removeMouseEventTap()
+        if let mouseDownMonitor = mouseDownMonitor {
+            NSEvent.removeMonitor(mouseDownMonitor)
+        }
         removeAXObserver()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-    }
-
-    // MARK: - Mouse Events
-
-    private func setupMouseEventTap() {
-        removeMouseEventTap()
-
-        let eventMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-
-        let callback: CGEventTapCallBack = { _, type, event, refcon in
-            guard let refcon = refcon else {
-                return Unmanaged.passUnretained(event)
-            }
-
-            let watcher = Unmanaged<WindowWatcher>.fromOpaque(refcon).takeUnretainedValue()
-
-            if type == .leftMouseDown {
-                let location = event.location
-                DispatchQueue.main.async {
-                    watcher.handleMouseDown(at: location)
-                }
-            } else if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                DispatchQueue.main.async {
-                    if let tap = watcher.mouseEventTap {
-                        CGEvent.tapEnable(tap: tap, enable: true)
-                    }
-                }
-            }
-
-            return Unmanaged.passUnretained(event)
-        }
-
-        guard let tap = CGEvent.tapCreate(
-            tap: .cghidEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: eventMask,
-            callback: callback,
-            userInfo: selfPtr
-        ) else {
-            return
-        }
-
-        guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
-            CFMachPortInvalidate(tap)
-            return
-        }
-
-        mouseEventTap = tap
-        mouseEventTapSource = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
-    }
-
-    private func removeMouseEventTap() {
-        if let source = mouseEventTapSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
-        }
-        if let tap = mouseEventTap {
-            CFMachPortInvalidate(tap)
-        }
-        mouseEventTapSource = nil
-        mouseEventTap = nil
     }
 
     // MARK: - AXObserver
@@ -173,23 +114,25 @@ class WindowWatcher {
         poll()
     }
 
-    private func handleMouseDown(at position: CGPoint) {
+    private func handleMouseDown(_ event: NSEvent) {
         guard activeWindowRect != nil,
-              let activeWindow = activeWindow else {
+              let activeWindow = activeWindow,
+              let cgEvent = event.cgEvent else {
             return
         }
 
-        guard let hitElement = elementAtScreenPosition(position),
+        guard let hitElement = elementAtScreenPosition(cgEvent.location),
               let minimizeButton = minimizeButtonElement(from: hitElement),
-              let containingWindow = containingWindow(of: minimizeButton) else {
+              let containingWindow = containingWindow(of: minimizeButton),
+              CFEqual(containingWindow, activeWindow) else {
             return
         }
 
-        if CFEqual(containingWindow, activeWindow) {
-            clearActiveWindow(immediate: true)
-        } else {
-            protectActiveWindowFromNonActiveMinimize()
-        }
+        nilStreak = 0
+        activeWindowRect = nil
+        self.activeWindow = nil
+        minimizationGracePeriod = Date().addingTimeInterval(0.4)
+        onChange?(true)
     }
 
     private func elementAtScreenPosition(_ position: CGPoint) -> AXUIElement? {
@@ -249,64 +192,10 @@ class WindowWatcher {
         return (value as! AXUIElement)
     }
 
-    private func clearActiveWindow(immediate: Bool) {
-        nilStreak = 0
-        activeWindowRect = nil
-        activeWindow = nil
-        clearNonActiveMinimizeProtection()
-        minimizationGracePeriod = Date().addingTimeInterval(0.4)
-        onChange?(immediate)
-    }
-
-    private func protectActiveWindowFromNonActiveMinimize() {
-        guard let activeWindowRect = activeWindowRect else { return }
-
-        protectedActiveWindow = activeWindow
-        protectedActiveWindowRect = activeWindowRect
-        protectedFrontAppBundleID = frontAppBundleID
-        nonActiveMinimizeProtectionUntil = Date().addingTimeInterval(0.7)
-    }
-
-    private func clearNonActiveMinimizeProtection() {
-        protectedActiveWindow = nil
-        protectedActiveWindowRect = nil
-        protectedFrontAppBundleID = nil
-        nonActiveMinimizeProtectionUntil = nil
-    }
-
-    private func keepProtectedActiveWindowIfNeeded() -> Bool {
-        guard let until = nonActiveMinimizeProtectionUntil else {
-            return false
-        }
-
-        if Date() >= until {
-            clearNonActiveMinimizeProtection()
-            return false
-        }
-
-        guard let protectedRect = protectedActiveWindowRect else {
-            clearNonActiveMinimizeProtection()
-            return false
-        }
-
-        nilStreak = 0
-        activeWindow = protectedActiveWindow
-        frontAppBundleID = protectedFrontAppBundleID
-
-        if activeWindowRect == nil || !protectedRect.equalTo(activeWindowRect!) {
-            activeWindowRect = protectedRect
-            onChange?(false)
-        }
-
-        return true
-    }
-
     @objc private func appChanged() {
         nilStreak = 0
         minimizationGracePeriod = nil
-        if nonActiveMinimizeProtectionUntil == nil {
-            activeWindow = nil
-        }
+        activeWindow = nil
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
         }
@@ -328,10 +217,6 @@ class WindowWatcher {
             return
         }
 
-        if keepProtectedActiveWindowIfNeeded() {
-            return
-        }
-
         lastFrontApp = frontApp
         frontAppBundleID = frontApp.bundleIdentifier
 
@@ -345,7 +230,6 @@ class WindowWatcher {
             if nilStreak >= nilThreshold && activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                clearNonActiveMinimizeProtection()
                 minimizationGracePeriod = nil
                 onChange?(false)
             }
@@ -363,7 +247,6 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                clearNonActiveMinimizeProtection()
                 minimizationGracePeriod = Date().addingTimeInterval(0.4)
                 onChange?(false)
             }
@@ -381,7 +264,6 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                clearNonActiveMinimizeProtection()
                 onChange?(false)
             }
             return
@@ -397,7 +279,6 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                clearNonActiveMinimizeProtection()
                 onChange?(false)
             }
             return
@@ -413,7 +294,6 @@ class WindowWatcher {
            newRect.width * newRect.height < lastRect.width * lastRect.height * 0.15 {
             activeWindowRect = nil
             activeWindow = nil
-            clearNonActiveMinimizeProtection()
             minimizationGracePeriod = Date().addingTimeInterval(0.4)
             onChange?(false)
             return
@@ -425,7 +305,6 @@ class WindowWatcher {
             return
         }
         minimizationGracePeriod = nil
-        clearNonActiveMinimizeProtection()
 
         if activeWindowRect == nil || !newRect.equalTo(activeWindowRect!) {
             activeWindowRect = newRect
