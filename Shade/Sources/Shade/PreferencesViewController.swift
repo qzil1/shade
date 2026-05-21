@@ -85,7 +85,8 @@ class PreferencesViewController: NSViewController {
         stack.addArrangedSubview(speedLabel)
 
         let speedSlider = NSSlider(value: 1.0 / overlayManager.animationDuration,
-                                   minValue: 1.0 / 0.3, maxValue: 1.0 / 0.02,
+                                   minValue: 1.0 / OverlayDefaults.slowAnimationDuration,
+                                   maxValue: 1.0 / OverlayDefaults.fastAnimationDuration,
                                    target: self, action: #selector(speedSliderChanged(_:)))
         speedSlider.controlSize = .small
         stack.addArrangedSubview(speedSlider)

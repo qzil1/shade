@@ -1,12 +1,19 @@
 import Cocoa
 
+enum OverlayDefaults {
+    static let isEnabled = true
+    static let slowAnimationDuration = 0.3
+    static let fastAnimationDuration = 0.02
+    static let mediumAnimationDuration = 1.0 / ((1.0 / slowAnimationDuration + 1.0 / fastAnimationDuration) / 2.0)
+}
+
 class OverlayManager {
     private var windows: [OverlayWindow] = []
     private var watcher: WindowWatcher?
     private var updateWorkItem: DispatchWorkItem?
     private var lastActiveRect: CGRect?
 
-    var isEnabled: Bool = true {
+    var isEnabled: Bool = OverlayDefaults.isEnabled {
         didSet { updateOverlays() }
     }
 
@@ -18,7 +25,7 @@ class OverlayManager {
         didSet { updateOverlays() }
     }
 
-    var animationDuration: Double = 0.12 {
+    var animationDuration: Double = OverlayDefaults.mediumAnimationDuration {
         didSet { updateOverlays() }
     }
 
