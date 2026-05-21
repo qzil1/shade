@@ -9,12 +9,7 @@ class WindowWatcher {
     private(set) var frontAppBundleID: String?
     private var axObserver: AXObserver?
     private var activeWindow: AXUIElement?
-    private var lastStableActiveWindow: AXUIElement?
-    private var lastStableActiveWindowRect: CGRect?
-    private var lastStableFrontAppBundleID: String?
-    private var preserveStableActiveWindowUntil: Date?
     private var mouseDownMonitor: Any?
-    private var pendingAppChangePoll: DispatchWorkItem?
 
     // Require 2 consecutive AX failures before treating as "no active window".
     // This filters out transient errors during minimize animations.
@@ -54,7 +49,6 @@ class WindowWatcher {
 
     deinit {
         timer?.invalidate()
-        pendingAppChangePoll?.cancel()
         if let mouseDownMonitor = mouseDownMonitor {
             NSEvent.removeMonitor(mouseDownMonitor)
         }
@@ -105,13 +99,15 @@ class WindowWatcher {
     }
 
     private func handleAXNotification(_ notification: String, element: AXUIElement) {
-        if notification == "AXWindowMiniaturized" {
-            if isCurrentOrStableWindow(element) {
-                clearActiveWindow(immediate: true)
-                return
-            }
-
-            preserveStableActiveWindow()
+        if notification == "AXWindowMiniaturized",
+           let activeWindow = activeWindow,
+           activeWindowRect != nil,
+           CFEqual(element, activeWindow) {
+            nilStreak = 0
+            activeWindowRect = nil
+            self.activeWindow = nil
+            minimizationGracePeriod = Date().addingTimeInterval(0.4)
+            onChange?(true)
             return
         }
 
@@ -119,22 +115,24 @@ class WindowWatcher {
     }
 
     private func handleMouseDown(_ event: NSEvent) {
-        guard activeWindowRect != nil || lastStableActiveWindowRect != nil,
+        guard activeWindowRect != nil,
+              let activeWindow = activeWindow,
               let cgEvent = event.cgEvent else {
             return
         }
 
         guard let hitElement = elementAtScreenPosition(cgEvent.location),
               let minimizeButton = minimizeButtonElement(from: hitElement),
-              let containingWindow = containingWindow(of: minimizeButton) else {
+              let containingWindow = containingWindow(of: minimizeButton),
+              CFEqual(containingWindow, activeWindow) else {
             return
         }
 
-        if isCurrentOrStableWindow(containingWindow) {
-            clearActiveWindow(immediate: true)
-        } else {
-            preserveStableActiveWindow()
-        }
+        nilStreak = 0
+        activeWindowRect = nil
+        self.activeWindow = nil
+        minimizationGracePeriod = Date().addingTimeInterval(0.4)
+        onChange?(true)
     }
 
     private func elementAtScreenPosition(_ position: CGPoint) -> AXUIElement? {
@@ -194,94 +192,14 @@ class WindowWatcher {
         return (value as! AXUIElement)
     }
 
-    private func isCurrentOrStableWindow(_ window: AXUIElement) -> Bool {
-        if let activeWindow = activeWindow, CFEqual(window, activeWindow) {
-            return true
-        }
-
-        if let lastStableActiveWindow = lastStableActiveWindow, CFEqual(window, lastStableActiveWindow) {
-            return true
-        }
-
-        return false
-    }
-
-    private func clearActiveWindow(immediate: Bool) {
-        nilStreak = 0
-        activeWindowRect = nil
-        activeWindow = nil
-        lastStableActiveWindow = nil
-        lastStableActiveWindowRect = nil
-        lastStableFrontAppBundleID = nil
-        preserveStableActiveWindowUntil = nil
-        minimizationGracePeriod = Date().addingTimeInterval(0.4)
-        onChange?(immediate)
-    }
-
-    private func recordStableActiveWindow(_ window: AXUIElement, rect: CGRect) {
-        activeWindow = window
-        lastStableActiveWindow = window
-        lastStableActiveWindowRect = rect
-        lastStableFrontAppBundleID = frontAppBundleID
-    }
-
-    private func preserveStableActiveWindow() {
-        guard let stableRect = lastStableActiveWindowRect else { return }
-
-        preserveStableActiveWindowUntil = Date().addingTimeInterval(0.6)
-
-        if let lastStableActiveWindow = lastStableActiveWindow {
-            activeWindow = lastStableActiveWindow
-        }
-        frontAppBundleID = lastStableFrontAppBundleID
-
-        if activeWindowRect == nil || !stableRect.equalTo(activeWindowRect!) {
-            activeWindowRect = stableRect
-            onChange?(false)
-        }
-    }
-
-    private func keepStableActiveWindowIfNeeded() -> Bool {
-        guard let until = preserveStableActiveWindowUntil else { return false }
-
-        if Date() >= until {
-            preserveStableActiveWindowUntil = nil
-            return false
-        }
-
-        guard let stableRect = lastStableActiveWindowRect else {
-            return false
-        }
-
-        nilStreak = 0
-        if let lastStableActiveWindow = lastStableActiveWindow {
-            activeWindow = lastStableActiveWindow
-        }
-        frontAppBundleID = lastStableFrontAppBundleID
-
-        if activeWindowRect == nil || !stableRect.equalTo(activeWindowRect!) {
-            activeWindowRect = stableRect
-            onChange?(false)
-        }
-
-        return true
-    }
-
     @objc private func appChanged() {
         nilStreak = 0
         minimizationGracePeriod = nil
+        activeWindow = nil
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
         }
-
-        // Give the mouse-down hit test for the same click a chance to mark
-        // non-active minimize before app activation polling rewrites stability.
-        pendingAppChangePoll?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.poll()
-        }
-        pendingAppChangePoll = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: workItem)
+        poll()
     }
 
     // MARK: - Polling
@@ -299,10 +217,6 @@ class WindowWatcher {
             return
         }
 
-        if keepStableActiveWindowIfNeeded() {
-            return
-        }
-
         lastFrontApp = frontApp
         frontAppBundleID = frontApp.bundleIdentifier
 
@@ -316,10 +230,6 @@ class WindowWatcher {
             if nilStreak >= nilThreshold && activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                lastStableActiveWindow = nil
-                lastStableActiveWindowRect = nil
-                lastStableFrontAppBundleID = nil
-                preserveStableActiveWindowUntil = nil
                 minimizationGracePeriod = nil
                 onChange?(false)
             }
@@ -337,10 +247,6 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                lastStableActiveWindow = nil
-                lastStableActiveWindowRect = nil
-                lastStableFrontAppBundleID = nil
-                preserveStableActiveWindowUntil = nil
                 minimizationGracePeriod = Date().addingTimeInterval(0.4)
                 onChange?(false)
             }
@@ -358,10 +264,6 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                lastStableActiveWindow = nil
-                lastStableActiveWindowRect = nil
-                lastStableFrontAppBundleID = nil
-                preserveStableActiveWindowUntil = nil
                 onChange?(false)
             }
             return
@@ -377,16 +279,13 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                lastStableActiveWindow = nil
-                lastStableActiveWindowRect = nil
-                lastStableFrontAppBundleID = nil
-                preserveStableActiveWindowUntil = nil
                 onChange?(false)
             }
             return
         }
 
         let newRect = CGRect(origin: position, size: size)
+        activeWindow = focusedWindow
 
         // Detect minimization by sudden rect collapse during animation.
         // When a window minimizes, its AX-reported rect shrinks dramatically.
@@ -395,10 +294,6 @@ class WindowWatcher {
            newRect.width * newRect.height < lastRect.width * lastRect.height * 0.15 {
             activeWindowRect = nil
             activeWindow = nil
-            lastStableActiveWindow = nil
-            lastStableActiveWindowRect = nil
-            lastStableFrontAppBundleID = nil
-            preserveStableActiveWindowUntil = nil
             minimizationGracePeriod = Date().addingTimeInterval(0.4)
             onChange?(false)
             return
@@ -410,8 +305,6 @@ class WindowWatcher {
             return
         }
         minimizationGracePeriod = nil
-        preserveStableActiveWindowUntil = nil
-        recordStableActiveWindow(focusedWindow, rect: newRect)
 
         if activeWindowRect == nil || !newRect.equalTo(activeWindowRect!) {
             activeWindowRect = newRect
