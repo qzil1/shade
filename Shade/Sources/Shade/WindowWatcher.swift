@@ -20,6 +20,13 @@ class WindowWatcher {
     // flicker caused by unstable AX data during the minimize animation.
     private var minimizationGracePeriod: Date?
 
+    // Movement detection: hide mask while window is being dragged/resized.
+    private var isMoving: Bool = false
+    private var stableCount: Int = 0
+    private var lastPolledRect: CGRect?
+    private let moveThreshold: CGFloat = 2.0
+    private let stableThreshold: Int = 3
+
     func start() {
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -195,6 +202,13 @@ class WindowWatcher {
     @objc private func appChanged() {
         nilStreak = 0
         minimizationGracePeriod = nil
+        lastPolledRect = nil
+        isMoving = false
+        stableCount = 0
+        if activeWindowRect != nil {
+            activeWindowRect = nil
+            onChange?(true)
+        }
         activeWindow = nil
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
@@ -231,7 +245,7 @@ class WindowWatcher {
                 activeWindowRect = nil
                 activeWindow = nil
                 minimizationGracePeriod = nil
-                onChange?(false)
+                onChange?(true)
             }
             return
         }
@@ -248,7 +262,7 @@ class WindowWatcher {
                 activeWindowRect = nil
                 activeWindow = nil
                 minimizationGracePeriod = Date().addingTimeInterval(0.4)
-                onChange?(false)
+                onChange?(true)
             }
             return
         }
@@ -264,7 +278,7 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                onChange?(false)
+                onChange?(true)
             }
             return
         }
@@ -279,7 +293,7 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                onChange?(false)
+                onChange?(true)
             }
             return
         }
@@ -295,7 +309,7 @@ class WindowWatcher {
             activeWindowRect = nil
             activeWindow = nil
             minimizationGracePeriod = Date().addingTimeInterval(0.4)
-            onChange?(false)
+            onChange?(true)
             return
         }
 
@@ -305,6 +319,36 @@ class WindowWatcher {
             return
         }
         minimizationGracePeriod = nil
+
+        // Movement detection: hide mask while window is being dragged/resized.
+        if !isMoving {
+            if let last = lastPolledRect,
+               (abs(newRect.origin.x - last.origin.x) > moveThreshold ||
+                abs(newRect.origin.y - last.origin.y) > moveThreshold) {
+                isMoving = true
+                stableCount = 0
+            }
+        } else {
+            if let last = lastPolledRect, newRect.equalTo(last) {
+                stableCount += 1
+            } else {
+                stableCount = 0
+            }
+
+            if stableCount >= stableThreshold {
+                isMoving = false
+                stableCount = 0
+            }
+        }
+        lastPolledRect = newRect
+
+        if isMoving {
+            if activeWindowRect != nil {
+                activeWindowRect = nil
+                onChange?(true)
+            }
+            return
+        }
 
         if activeWindowRect == nil || !newRect.equalTo(activeWindowRect!) {
             activeWindowRect = newRect
