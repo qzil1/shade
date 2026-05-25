@@ -10,9 +10,7 @@ class WindowWatcher {
     private var axObserver: AXObserver?
     private var activeWindow: AXUIElement?
     private var mouseDownMonitor: Any?
-
     // Require 2 consecutive AX failures before treating as "no active window".
-    // This filters out transient errors during minimize animations.
     private var nilStreak: Int = 0
     private let nilThreshold: Int = 2
 
@@ -34,7 +32,6 @@ class WindowWatcher {
             name: NSWorkspace.didActivateApplicationNotification,
             object: nil
         )
-
         timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             self?.poll()
         }
@@ -199,16 +196,32 @@ class WindowWatcher {
         return (value as! AXUIElement)
     }
 
+    private func isWindowOnScreen(_ window: AXUIElement) -> Bool {
+        guard let handle = dlopen(nil, RTLD_NOW),
+              let sym = dlsym(handle, "AXUIElementGetWindow") else {
+            return true
+        }
+
+        typealias AXUIElementGetWindowFunc = @convention(c) (AXUIElement, UnsafeMutablePointer<UInt32>) -> Int32
+        let fn = unsafeBitCast(sym, to: AXUIElementGetWindowFunc.self)
+
+        var windowID: UInt32 = 0
+        guard fn(window, &windowID) == 0 else {
+            return true
+        }
+
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+        return windowList?.contains { dict in
+            (dict[kCGWindowNumber as String] as? UInt32) == windowID
+        } ?? true
+    }
+
     @objc private func appChanged() {
         nilStreak = 0
         minimizationGracePeriod = nil
         lastPolledRect = nil
         isMoving = false
         stableCount = 0
-        if activeWindowRect != nil {
-            activeWindowRect = nil
-            onChange?(true)
-        }
         activeWindow = nil
         if let frontApp = NSWorkspace.shared.frontmostApplication {
             setupAXObserver(for: frontApp)
@@ -245,12 +258,23 @@ class WindowWatcher {
                 activeWindowRect = nil
                 activeWindow = nil
                 minimizationGracePeriod = nil
-                onChange?(true)
+                onChange?(false)
             }
             return
         }
         nilStreak = 0
         let focusedWindow = axWindow as! AXUIElement
+
+        // If the focused window is not actually visible on the current space,
+        // treat it as no active window (e.g. during a space swipe).
+        if !isWindowOnScreen(focusedWindow) {
+            if activeWindowRect != nil {
+                activeWindowRect = nil
+                activeWindow = nil
+                onChange?(true)
+            }
+            return
+        }
 
         // Check minimized first: if true, skip reading position/size entirely.
         var minimizedValue: AnyObject?
@@ -278,7 +302,7 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                onChange?(true)
+                onChange?(false)
             }
             return
         }
@@ -293,7 +317,7 @@ class WindowWatcher {
             if activeWindowRect != nil {
                 activeWindowRect = nil
                 activeWindow = nil
-                onChange?(true)
+                onChange?(false)
             }
             return
         }
@@ -324,7 +348,9 @@ class WindowWatcher {
         if !isMoving {
             if let last = lastPolledRect,
                (abs(newRect.origin.x - last.origin.x) > moveThreshold ||
-                abs(newRect.origin.y - last.origin.y) > moveThreshold) {
+                abs(newRect.origin.y - last.origin.y) > moveThreshold ||
+                abs(newRect.width - last.width) > moveThreshold ||
+                abs(newRect.height - last.height) > moveThreshold) {
                 isMoving = true
                 stableCount = 0
             }

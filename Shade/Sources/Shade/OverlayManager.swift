@@ -11,6 +11,7 @@ class OverlayManager {
     private var windows: [OverlayWindow] = []
     private var watcher: WindowWatcher?
     private var updateWorkItem: DispatchWorkItem?
+    private var transitionWorkItem: DispatchWorkItem?
     private var lastActiveRect: CGRect?
 
     var isEnabled: Bool = OverlayDefaults.isEnabled {
@@ -63,6 +64,7 @@ class OverlayManager {
     private func updateOverlays(immediate: Bool = false) {
         guard isEnabled else {
             updateWorkItem?.cancel()
+            transitionWorkItem?.cancel()
             lastActiveRect = nil
             windows.forEach { $0.hideMask(duration: animationDuration) }
             return
@@ -71,16 +73,36 @@ class OverlayManager {
         let currentRect = watcher?.activeWindowRect
         let hadRect = lastActiveRect != nil && !(lastActiveRect?.isEmpty ?? true)
         let hasRect = currentRect != nil && !(currentRect?.isEmpty ?? true)
+
+        let isSwitch = hadRect && hasRect
+            && lastActiveRect != nil && currentRect != nil
+            && !lastActiveRect!.equalTo(currentRect!)
+
         lastActiveRect = currentRect
 
         if immediate || hadRect == hasRect {
             // Continuous change (window moving/resizing) or stable state — update immediately
             updateWorkItem?.cancel()
-            performUpdateOverlays(immediate: immediate)
+            transitionWorkItem?.cancel()
+
+            if isSwitch && !immediate {
+                // Transition: hole disappears (full mask), then new hole appears immediately.
+                // Step 1: animate hole collapsing into full mask.
+                performUpdateOverlays(forceHole: false)
+                // Step 2: show new hole without path animation so it doesn't fly in from (-1,-1).
+                let workItem = DispatchWorkItem { [weak self] in
+                    self?.performUpdateOverlays(customDuration: 0)
+                }
+                transitionWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration, execute: workItem)
+            } else {
+                performUpdateOverlays(immediate: immediate)
+            }
         } else {
             // Window appeared or disappeared — debounce to avoid flicker from rapid nil↔rect switching.
             // 0.05s aligns with the poll interval so at most one transient switch is merged.
             updateWorkItem?.cancel()
+            transitionWorkItem?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
                 self?.performUpdateOverlays()
             }
@@ -89,15 +111,17 @@ class OverlayManager {
         }
     }
 
-    private func performUpdateOverlays(immediate: Bool = false) {
+    private func performUpdateOverlays(immediate: Bool = false, forceHole: Bool = true, customDuration: Double? = nil) {
+        let duration = customDuration ?? animationDuration
+
         guard isEnabled else {
-            windows.forEach { $0.hideMask(duration: animationDuration) }
+            windows.forEach { $0.hideMask(duration: duration) }
             return
         }
 
         guard var activeRect = watcher?.activeWindowRect, !activeRect.isEmpty else {
             // No active window (e.g. minimized, back to desktop) — clear all masks quickly
-            windows.forEach { $0.hideMask(duration: immediate ? 0 : min(animationDuration, 0.06)) }
+            windows.forEach { $0.hideMask(duration: immediate ? 0 : min(duration, 0.06)) }
             return
         }
 
@@ -129,15 +153,21 @@ class OverlayManager {
             // Only show a hole if the window meaningfully overlaps this screen.
             // A tiny sliver (e.g. 19 px) at a screen edge looks like a glitch.
             let minVisible: CGFloat = 40
-            if !intersection.isNull && intersection.width > minVisible && intersection.height > minVisible {
+            let shouldShowHole = !intersection.isNull
+                && intersection.width > minVisible
+                && intersection.height > minVisible
+
+            if shouldShowHole && forceHole {
                 var local = intersection
                 local.origin.x -= windowFrame.origin.x
                 local.origin.y -= windowFrame.origin.y
-                window.showMask(holeRect: local, alpha: dimmingAlpha, duration: animationDuration, cornerRadius: radius)
-            } else if dimAdditionalDisplays {
-                window.showMask(holeRect: nil, alpha: dimmingAlpha, duration: animationDuration, cornerRadius: radius)
+                window.showMask(holeRect: local, alpha: dimmingAlpha, duration: duration, cornerRadius: radius)
+            } else if !forceHole || dimAdditionalDisplays {
+                // Transition mode: always show full mask (no hole).
+                // Normal mode: show full mask on non-active displays when enabled.
+                window.showMask(holeRect: nil, alpha: dimmingAlpha, duration: duration, cornerRadius: radius)
             } else {
-                window.hideMask(duration: animationDuration)
+                window.hideMask(duration: duration)
             }
         }
     }
