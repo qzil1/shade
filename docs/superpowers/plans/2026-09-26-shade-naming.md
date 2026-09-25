@@ -4,7 +4,7 @@
 
 **Goal:** Use `shade` for the repository and canonical checkout, and `Shade` for the application and its project directory.
 
-**Architecture:** Rename packaging paths and project documentation without changing application behavior, the existing bundle identifier. Keep Git history and repair the linked worktree after moving the main checkout.
+**Architecture:** Rename packaging paths and project documentation without changing application behavior or the existing bundle identifier. Repair the linked worktree after moving the main checkout.
 
 **Tech Stack:** Swift, AppKit, Git, Markdown, GitHub.
 
@@ -20,9 +20,9 @@
 - All 25 core checks passed after the directory move.
 - A clean temporary-copy arm64 build, Info.plist validation, and strict ad-hoc signature verification passed. No installed or existing local app bundle was replaced.
 - All 22 tracked files inside the moved project directory are byte-identical to the pre-migration commit, including source, tests, scripts, configuration, and icon.
-- Naming checks use the current project identity; generated app/build directories remain ignored.
+- The application and its current project paths use Shade consistently; generated app/build directories remain ignored.
 - GitHub upload is handled separately by the existing upload agent; its result must be verified against the committed migration.
 
 ## Scope and evidence
 
-This is a naming migration, not a trademark clearance or license grant. The repository has no LICENSE file at the time of inspection. Existing icon provenance is not established by its binary or Git history alone. Preserve existing attribution and do not assert that renaming resolves all intellectual-property questions.
+The migration preserves application behavior and its existing bundle identifier. It does not add a license or change the release acceptance criteria.
