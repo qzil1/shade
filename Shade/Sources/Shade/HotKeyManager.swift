@@ -10,7 +10,10 @@ class HotKeyManager {
     var onIncreaseAlpha: (() -> Void)?
     var onToggleMultiDisplay: (() -> Void)?
 
-    func register() {
+    @discardableResult
+    func register() -> [String] {
+        unregister()
+        var failures: [String] = []
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -36,7 +39,7 @@ class HotKeyManager {
             return noErr
         }
 
-        InstallEventHandler(
+        let handlerStatus = InstallEventHandler(
             GetEventDispatcherTarget(),
             callback,
             1,
@@ -45,20 +48,17 @@ class HotKeyManager {
             &eventHandler
         )
 
-        registerHotKey(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey | shiftKey), id: 1)
-        registerHotKey(keyCode: UInt32(kVK_DownArrow), modifiers: UInt32(cmdKey | shiftKey), id: 2)
-        registerHotKey(keyCode: UInt32(kVK_UpArrow), modifiers: UInt32(cmdKey | shiftKey), id: 3)
-        registerHotKey(keyCode: UInt32(kVK_ANSI_M), modifiers: UInt32(cmdKey | shiftKey), id: 4)
-    }
-
-    private func registerHotKey(keyCode: UInt32, modifiers: UInt32, id: UInt32) {
-        var hotKeyRef: EventHotKeyRef?
-        let signature = fourCharCode(from: "HZOV")
-        let hotKeyID = EventHotKeyID(signature: signature, id: id)
-        let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetEventDispatcherTarget(), 0, &hotKeyRef)
-        if status == noErr, let ref = hotKeyRef {
-            hotKeyRefs.append(ref)
+        guard handlerStatus == noErr else { return ["全局快捷键监听"] }
+        for (key, id, label) in [(kVK_ANSI_H, 1, "⇧⌘H"), (kVK_DownArrow, 2, "⇧⌘↓"),
+                                 (kVK_UpArrow, 3, "⇧⌘↑"), (kVK_ANSI_M, 4, "⇧⌘M")] {
+            var ref: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(signature: fourCharCode(from: "HZOV"), id: UInt32(id))
+            let status = RegisterEventHotKey(UInt32(key), UInt32(cmdKey | shiftKey), hotKeyID,
+                                            GetEventDispatcherTarget(), 0, &ref)
+            if status == noErr, let ref = ref { hotKeyRefs.append(ref) }
+            else { failures.append(label) }
         }
+        return failures
     }
 
     private func handleHotKey(id: UInt32) {

@@ -69,14 +69,14 @@ class AccessibilityPromptWindow: NSWindowController {
         stack.addArrangedSubview(title)
 
         let desc = NSTextField(wrappingLabelWithString:
-            "Shade 需要辅助功能权限来获取窗口位置信息，以便显示遮罩效果。")
+            "允许 Shade 识别活动窗口，让背景自然变暗。无需屏幕录制权限，不读取或保存窗口内容。")
         desc.font = NSFont.systemFont(ofSize: 13)
         desc.alignment = .center
         desc.textColor = .secondaryLabelColor
         stack.addArrangedSubview(desc)
 
         let instruction = NSTextField(wrappingLabelWithString:
-            "请前往 系统设置 → 隐私与安全 → 辅助功能，添加并勾选 Shade。")
+            "在系统设置 → 隐私与安全 → 辅助功能中启用 Shade。授权后会自动生效，无需重启。")
         instruction.font = NSFont.systemFont(ofSize: 12)
         instruction.alignment = .center
         instruction.textColor = .tertiaryLabelColor
@@ -98,8 +98,7 @@ class AccessibilityPromptWindow: NSWindowController {
     }
 
     @objc private func openSettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-        NSWorkspace.shared.open(url)
+        PermissionSupport.openSettings()
         closeWindow()
     }
 

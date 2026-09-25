@@ -1,49 +1,53 @@
 import Cocoa
 
-class AppDelegate: NSObject, NSApplicationDelegate, AccessibilityPromptWindowDelegate {
-    var overlayManager: OverlayManager!
-    var statusBarController: StatusBarController!
-    var promptWindow: AccessibilityPromptWindow?
-    var hotKeyManager: HotKeyManager!
+final class AppDelegate: NSObject, NSApplicationDelegate, AccessibilityPromptWindowDelegate {
+    private var overlayManager: OverlayManager!
+    private var statusBarController: StatusBarController!
+    private var promptWindow: AccessibilityPromptWindow?
+    private var hotKeyManager: HotKeyManager!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let trusted = AXIsProcessTrustedWithOptions(
-            [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
-        )
-
+        if let id = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+            NSApp.terminate(nil)
+            return
+        }
         overlayManager = OverlayManager()
-        statusBarController = StatusBarController(overlayManager: overlayManager)
         overlayManager.start()
-
+        statusBarController = StatusBarController(overlayManager: overlayManager)
         hotKeyManager = HotKeyManager()
-        hotKeyManager.onToggleDimming = { [weak self] in
-            self?.overlayManager.isEnabled.toggle()
-        }
-        hotKeyManager.onDecreaseAlpha = { [weak self] in
-            self?.overlayManager.dimmingAlpha = max(0.1, (self?.overlayManager.dimmingAlpha ?? 0.55) - 0.05)
-        }
-        hotKeyManager.onIncreaseAlpha = { [weak self] in
-            self?.overlayManager.dimmingAlpha = min(0.9, (self?.overlayManager.dimmingAlpha ?? 0.55) + 0.05)
-        }
+        hotKeyManager.onToggleDimming = { [weak self] in self?.overlayManager.isEnabled.toggle() }
+        hotKeyManager.onDecreaseAlpha = { [weak self] in self?.overlayManager.adjustIntensity(by: -0.05) }
+        hotKeyManager.onIncreaseAlpha = { [weak self] in self?.overlayManager.adjustIntensity(by: 0.05) }
         hotKeyManager.onToggleMultiDisplay = { [weak self] in
-            self?.overlayManager.dimAdditionalDisplays.toggle()
+            guard let settings = self?.overlayManager.settings else { return }
+            let modes = DisplayMode.allCases
+            let current = modes.firstIndex(of: settings.displayMode) ?? 0
+            settings.displayMode = modes[(current + 1) % modes.count]
         }
-        hotKeyManager.register()
-
-        if !trusted {
-            overlayManager.isEnabled = false
+        overlayManager.reportShortcutFailures(hotKeyManager.register())
+        NotificationCenter.default.addObserver(self, selector: #selector(permissionChanged), name: .shadeStatusDidChange, object: overlayManager)
+        if !overlayManager.watcher.hasPermission {
             promptWindow = AccessibilityPromptWindow()
             promptWindow?.delegate = self
             promptWindow?.showWindow(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
     }
-
-    func accessibilityPromptWindowDidClose() {
-        promptWindow = nil
-        let trusted = AXIsProcessTrustedWithOptions(
-            [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
-        )
-        overlayManager.isEnabled = trusted
+    @objc private func permissionChanged() {
+        if overlayManager.watcher.hasPermission {
+            promptWindow?.close()
+            promptWindow = nil
+        }
+    }
+    func accessibilityPromptWindowDidClose() { promptWindow = nil }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        statusBarController?.showSettings()
+        return true
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        hotKeyManager?.unregister()
+        overlayManager?.stop()
+        NotificationCenter.default.removeObserver(self)
     }
 }

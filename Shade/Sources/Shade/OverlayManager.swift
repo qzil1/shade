@@ -1,174 +1,121 @@
 import Cocoa
 
-enum OverlayDefaults {
-    static let isEnabled = true
-    static let slowAnimationDuration = 0.3
-    static let fastAnimationDuration = 0.02
-    static let mediumAnimationDuration = 1.0 / ((1.0 / slowAnimationDuration + 1.0 / fastAnimationDuration) / 2.0)
-}
-
-class OverlayManager {
-    private var windows: [OverlayWindow] = []
-    private var watcher: WindowWatcher?
-    private var updateWorkItem: DispatchWorkItem?
-    private var transitionWorkItem: DispatchWorkItem?
-    private var lastActiveRect: CGRect?
-
-    var isEnabled: Bool = OverlayDefaults.isEnabled {
-        didSet { updateOverlays() }
+final class OverlayManager: NSObject {
+    let settings: ShadeSettings
+    let watcher = WindowWatcher()
+    private(set) var windows: [OverlayWindow] = []
+    private var flagsMonitor: Any?
+    private var localFlagsMonitor: Any?
+    private var appearanceObservation: NSKeyValueObservation?
+    private var lastStatus = ""
+    private(set) var isTemporarilyPaused = false
+    private(set) var shortcutWarning: String? {
+        didSet { NotificationCenter.default.post(name: .shadeStatusDidChange, object: self) }
     }
 
-    var dimmingAlpha: CGFloat = 0.55 {
-        didSet { updateOverlays() }
-    }
+    init(settings: ShadeSettings = ShadeSettings()) { self.settings = settings; super.init() }
 
-    var dimAdditionalDisplays: Bool = true {
-        didSet { updateOverlays() }
-    }
-
-    var animationDuration: Double = OverlayDefaults.mediumAnimationDuration {
-        didSet { updateOverlays() }
+    var isEnabled: Bool { get { settings.isEnabled } set { settings.isEnabled = newValue } }
+    var dimmingAlpha: CGFloat { get { CGFloat(settings.intensity) } set { settings.intensity = Double(newValue) } }
+    var statusText: String {
+        if !watcher.hasPermission { return "需要辅助功能权限" }
+        if !isEnabled { return "已暂停 · 随时回到专注" }
+        if isTemporarilyPaused { return "临时暂停 · 松开 Fn 恢复" }
+        if watcher.isSuspended { return "等待桌面唤醒" }
+        if let id = watcher.frontAppBundleID, settings.excludedApplications.contains(id) { return "当前应用已排除" }
+        if watcher.isFullscreen { return "全屏模式 · 自动暂停" }
+        if watcher.activeWindow == nil { return "桌面清晰 · 等待活动窗口" }
+        return "正在专注 · \(watcher.frontAppName)"
     }
 
     func start() {
         createWindows()
-
-        watcher = WindowWatcher()
-        watcher?.onChange = { [weak self] immediate in
-            self?.updateOverlays(immediate: immediate)
+        NotificationCenter.default.addObserver(self, selector: #selector(settingsChanged), name: .shadeSettingsDidChange, object: settings)
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        appearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.initial, .new]) { [weak self] app, _ in
+            self?.settings.useDarkAppearance = app.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         }
-        watcher?.start()
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(screensChanged),
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
-        )
+        watcher.onChange = { [weak self] in self?.render() }
+        watcher.isTrackingEnabled = isEnabled
+        watcher.start()
+        flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] in self?.flagsChanged($0) }
+        localFlagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.flagsChanged(event); return event
+        }
     }
 
+    func stop() {
+        watcher.stop()
+        watcher.onChange = nil
+        windows.forEach { $0.close() }; windows.removeAll()
+        if let value = flagsMonitor { NSEvent.removeMonitor(value); flagsMonitor = nil }
+        if let value = localFlagsMonitor { NSEvent.removeMonitor(value); localFlagsMonitor = nil }
+        NotificationCenter.default.removeObserver(self)
+        appearanceObservation = nil
+    }
+
+    @objc private func settingsChanged() {
+        watcher.isTrackingEnabled = isEnabled
+        if !settings.pauseWithFn { isTemporarilyPaused = false }
+        if isEnabled { watcher.refresh() } else { render() }
+    }
     @objc private func screensChanged() {
         createWindows()
-        updateOverlays()
+        watcher.scheduleRefresh(settle: true)
     }
-
     private func createWindows() {
         windows.forEach { $0.close() }
-        windows = NSScreen.screens.map { screen in
-            let w = OverlayWindow(screen: screen)
-            w.orderFront()
-            return w
-        }
+        windows = NSScreen.screens.map(OverlayWindow.init(screen:))
+        watcher.ignoredWindowIDs = Set(windows.map { CGWindowID($0.window.windowNumber) })
+    }
+    private func flagsChanged(_ event: NSEvent) {
+        let paused = settings.pauseWithFn && event.modifierFlags.contains(.function)
+        if paused != isTemporarilyPaused { isTemporarilyPaused = paused; render() }
+    }
+    func adjustIntensity(by delta: Double) { settings.intensity += delta }
+    func reportShortcutFailures(_ names: [String]) {
+        shortcutWarning = names.isEmpty ? nil : "快捷键被其他应用占用：" + names.joined(separator: "、")
     }
 
-    private func updateOverlays(immediate: Bool = false) {
-        guard isEnabled else {
-            updateWorkItem?.cancel()
-            transitionWorkItem?.cancel()
-            lastActiveRect = nil
-            windows.forEach { $0.hideMask(duration: animationDuration) }
+    private func render() {
+        isTemporarilyPaused = settings.pauseWithFn && CGEventSource.flagsState(.combinedSessionState).contains(.maskSecondaryFn)
+        let status = statusText
+        if lastStatus != status {
+            lastStatus = status
+            NotificationCenter.default.post(name: .shadeStatusDidChange, object: self)
+        }
+        let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : settings.fadeDuration
+        let excluded = watcher.frontAppBundleID.map { settings.excludedApplications.contains($0) } ?? false
+        guard isEnabled, watcher.hasPermission, !watcher.isSuspended,
+              !isTemporarilyPaused, !excluded, !watcher.isFullscreen,
+              let active = watcher.activeWindow else {
+            let userPause = !isEnabled || isTemporarilyPaused || excluded
+            windows.forEach { $0.hide(duration: userPause ? duration : 0) }
             return
         }
-
-        let currentRect = watcher?.activeWindowRect
-        let hadRect = lastActiveRect != nil && !(lastActiveRect?.isEmpty ?? true)
-        let hasRect = currentRect != nil && !(currentRect?.isEmpty ?? true)
-
-        let isSwitch = hadRect && hasRect
-            && lastActiveRect != nil && currentRect != nil
-            && !lastActiveRect!.equalTo(currentRect!)
-
-        lastActiveRect = currentRect
-
-        if immediate || hadRect == hasRect {
-            // Continuous change (window moving/resizing) or stable state — update immediately
-            updateWorkItem?.cancel()
-            transitionWorkItem?.cancel()
-
-            if isSwitch && !immediate {
-                // Transition: hole disappears (full mask), then new hole appears immediately.
-                // Step 1: animate hole collapsing into full mask.
-                performUpdateOverlays(forceHole: false)
-                // Step 2: show new hole without path animation so it doesn't fly in from (-1,-1).
-                let workItem = DispatchWorkItem { [weak self] in
-                    self?.performUpdateOverlays(customDuration: 0)
-                }
-                transitionWorkItem = workItem
-                DispatchQueue.main.asyncAfter(deadline: .now() + animationDuration, execute: workItem)
-            } else {
-                performUpdateOverlays(immediate: immediate)
-            }
-        } else {
-            // Window appeared or disappeared — debounce to avoid flicker from rapid nil↔rect switching.
-            // 0.05s aligns with the poll interval so at most one transient switch is merged.
-            updateWorkItem?.cancel()
-            transitionWorkItem?.cancel()
-            let workItem = DispatchWorkItem { [weak self] in
-                self?.performUpdateOverlays()
-            }
-            updateWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
-        }
-    }
-
-    private func performUpdateOverlays(immediate: Bool = false, forceHole: Bool = true, customDuration: Double? = nil) {
-        let duration = customDuration ?? animationDuration
-
-        guard isEnabled else {
-            windows.forEach { $0.hideMask(duration: duration) }
-            return
-        }
-
-        guard var activeRect = watcher?.activeWindowRect, !activeRect.isEmpty else {
-            // No active window (e.g. minimized, back to desktop) — clear all masks quickly
-            windows.forEach { $0.hideMask(duration: immediate ? 0 : min(duration, 0.06)) }
-            return
-        }
-
-        // Accessibility API returns coordinates with top-left origin (Y down),
-        // but NSScreen.frame / NSWindow.frame use bottom-left origin (Y up).
-        // The AX origin is fixed to the primary display (menu bar), so we must
-        // use CGMainDisplayID() instead of NSScreen.main which changes with
-        // the key window.
         let primaryID = CGMainDisplayID()
-        let primaryScreen = NSScreen.screens.first { screen in
-            let sid = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
-            return sid == primaryID
-        }
-        let primaryFrame = primaryScreen?.frame ?? NSScreen.main?.frame ?? .zero
-        activeRect.origin.y = primaryFrame.minY + primaryFrame.height - activeRect.origin.y - activeRect.height
-
-        let radius: CGFloat
-        if let bundleID = watcher?.frontAppBundleID, bundleID.hasPrefix("com.apple.") {
-            radius = 24
-        } else {
-            radius = 14
-        }
-
-        for window in windows {
-            let screenFrame = window.targetScreen.frame
-            let windowFrame = window.window.frame
-            let intersection = activeRect.intersection(screenFrame)
-
-            // Only show a hole if the window meaningfully overlaps this screen.
-            // A tiny sliver (e.g. 19 px) at a screen edge looks like a glitch.
-            let minVisible: CGFloat = 40
-            let shouldShowHole = !intersection.isNull
-                && intersection.width > minVisible
-                && intersection.height > minVisible
-
-            if shouldShowHole && forceHole {
-                var local = intersection
-                local.origin.x -= windowFrame.origin.x
-                local.origin.y -= windowFrame.origin.y
-                window.showMask(holeRect: local, alpha: dimmingAlpha, duration: duration, cornerRadius: radius)
-            } else if !forceHole || dimAdditionalDisplays {
-                // Transition mode: always show full mask (no hole).
-                // Normal mode: show full mask on non-active displays when enabled.
-                window.showMask(holeRect: nil, alpha: dimmingAlpha, duration: duration, cornerRadius: radius)
+        let primaryTop = NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == primaryID
+        }?.frame.maxY ?? 0
+        let displays = windows.map { DisplayInfo(id: $0.displayID, frame: DisplayInfo.axFrame(appKitFrame: $0.targetScreen.frame, primaryTop: primaryTop)) }
+        let placements = DimmingPolicy.placements(displays: displays, windows: watcher.windows, active: active,
+                                                  mode: settings.displayMode, excludedDisplays: settings.excludedDisplays)
+        for overlay in windows {
+            let placement = placements[overlay.displayID] ?? .hidden
+            let level = watcher.windows.first { $0.id == placement.windowID }?.layer ?? active.layer
+            if placement == .hidden || settings.intensity == 0 {
+                overlay.hide(duration: duration)
             } else {
-                window.hideMask(duration: duration)
+                let target = watcher.windows.first { $0.id == placement.windowID } ?? active
+                let screen = overlay.targetScreen.frame
+                let local = CGRect(x: target.frame.minX - screen.minX,
+                                   y: primaryTop - target.frame.maxY - screen.minY,
+                                   width: target.frame.width, height: target.frame.height)
+                overlay.show(placement: placement, focusedRect: local, level: level, color: settings.tint.color,
+                             alpha: settings.intensity, duration: duration)
             }
         }
     }
+
+    deinit { stop() }
 }

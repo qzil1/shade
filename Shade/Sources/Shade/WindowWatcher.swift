@@ -1,384 +1,225 @@
 import Cocoa
 
-class WindowWatcher {
-    var onChange: ((_ immediate: Bool) -> Void)?
-    private(set) var activeWindowRect: CGRect?
+final class WindowWatcher {
+    var onChange: (() -> Void)?
+    var ignoredWindowIDs: Set<CGWindowID> = []
+    var isTrackingEnabled = true
+    private(set) var activeWindow: WindowInfo?
+    private(set) var windows: [WindowInfo] = []
+    private(set) var frontAppBundleID: String?
+    private(set) var frontAppName = ""
+    private(set) var hasPermission = false
+    private(set) var isFullscreen = false
+    private(set) var isSuspended = false
 
     private var timer: Timer?
-    private var lastFrontApp: NSRunningApplication?
-    private(set) var frontAppBundleID: String?
-    private var axObserver: AXObserver?
-    private var activeWindow: AXUIElement?
-    private var mouseDownMonitor: Any?
-    // Require 2 consecutive AX failures before treating as "no active window".
-    private var nilStreak: Int = 0
-    private let nilThreshold: Int = 2
-
-    // After detecting minimization, ignore rect recoveries for 0.4s to avoid
-    // flicker caused by unstable AX data during the minimize animation.
-    private var minimizationGracePeriod: Date?
-
-    // Movement detection: hide mask while window is being dragged/resized.
-    private var isMoving: Bool = false
-    private var stableCount: Int = 0
-    private var lastPolledRect: CGRect?
-    private let moveThreshold: CGFloat = 2.0
-    private let stableThreshold: Int = 3
+    private var observer: AXObserver?
+    private var observedApp: AXUIElement?
+    private var observedWindow: AXUIElement?
+    private var observedPID: pid_t?
+    private var resolvedWindowID: CGWindowID?
+    private var lastExternalFocus: (id: CGWindowID, bundleID: String?, name: String, fullscreen: Bool)?
+    private var refreshWork: DispatchWorkItem?
+    private var settlingWork: DispatchWorkItem?
+    private var mouseMonitor: Any?
+    private var notificationTokens: [NSObjectProtocol] = []
+    private let windowNotifications = [kAXMovedNotification, kAXResizedNotification,
+        kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification, kAXUIElementDestroyedNotification]
 
     func start() {
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self,
-            selector: #selector(appChanged),
-            name: NSWorkspace.didActivateApplicationNotification,
-            object: nil
-        )
-        timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            self?.poll()
+        guard timer == nil else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        func observe(_ name: Notification.Name, _ action: @escaping () -> Void) {
+            notificationTokens.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in action() })
         }
-
-        mouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-            if Thread.isMainThread {
-                self?.handleMouseDown(event)
-            } else {
-                DispatchQueue.main.async {
-                    self?.handleMouseDown(event)
-                }
-            }
+        observe(NSWorkspace.didActivateApplicationNotification) { [weak self] in self?.scheduleRefresh(settle: true) }
+        observe(NSWorkspace.didHideApplicationNotification) { [weak self] in self?.scheduleRefresh(settle: true) }
+        observe(NSWorkspace.didTerminateApplicationNotification) { [weak self] in self?.scheduleRefresh() }
+        observe(NSWorkspace.activeSpaceDidChangeNotification) { [weak self] in
+            self?.activeWindow = nil
+            self?.onChange?()
+            self?.scheduleRefresh(settle: true)
         }
-
-        if let frontApp = NSWorkspace.shared.frontmostApplication {
-            setupAXObserver(for: frontApp)
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
+                     NSWorkspace.sessionDidResignActiveNotification] {
+            observe(name) { [weak self] in self?.suspend() }
         }
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification,
+                     NSWorkspace.sessionDidBecomeActiveNotification] {
+            observe(name) { [weak self] in self?.isSuspended = false; self?.scheduleRefresh(settle: true) }
+        }
+        // AX handles normal operation; a low-frequency watchdog repairs missed
+        // notifications and discovers permission changes without relaunching.
+        let timer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in self?.refresh() }
+        timer.tolerance = 0.15
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { [weak self] _ in
+            self?.scheduleRefresh(settle: true)
+        }
+        refresh()
     }
 
-    deinit {
-        timer?.invalidate()
-        if let mouseDownMonitor = mouseDownMonitor {
-            NSEvent.removeMonitor(mouseDownMonitor)
-        }
-        removeAXObserver()
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
-    }
-
-    // MARK: - AXObserver
-
-    private func removeAXObserver() {
-        guard let observer = axObserver else { return }
-        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
-        axObserver = nil
-    }
-
-    private func setupAXObserver(for app: NSRunningApplication) {
-        removeAXObserver()
-
-        if app.processIdentifier == ProcessInfo.processInfo.processIdentifier {
-            return
-        }
-
-        let pid = pid_t(app.processIdentifier)
-        var newObserver: AXObserver?
-
-        let callback: AXObserverCallback = { _, element, notification, refcon in
-            guard let refcon = refcon else { return }
-            let watcher = Unmanaged<WindowWatcher>.fromOpaque(refcon).takeUnretainedValue()
-            let notificationName = notification as String
-            DispatchQueue.main.async {
-                watcher.handleAXNotification(notificationName, element: element)
-            }
-        }
-
-        guard AXObserverCreate(pid, callback, &newObserver) == .success, let observer = newObserver else {
-            return
-        }
-
-        let axApp = AXUIElementCreateApplication(pid)
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-
-        AXObserverAddNotification(observer, axApp, "AXFocusedWindowChanged" as CFString, selfPtr)
-        AXObserverAddNotification(observer, axApp, "AXWindowMiniaturized" as CFString, selfPtr)
-        AXObserverAddNotification(observer, axApp, "AXWindowDeminiaturized" as CFString, selfPtr)
-
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
-        axObserver = observer
-    }
-
-    private func handleAXNotification(_ notification: String, element: AXUIElement) {
-        if notification == "AXWindowMiniaturized",
-           let activeWindow = activeWindow,
-           activeWindowRect != nil,
-           CFEqual(element, activeWindow) {
-            nilStreak = 0
-            activeWindowRect = nil
-            self.activeWindow = nil
-            minimizationGracePeriod = Date().addingTimeInterval(0.4)
-            onChange?(true)
-            return
-        }
-
-        poll()
-    }
-
-    private func handleMouseDown(_ event: NSEvent) {
-        guard activeWindowRect != nil,
-              let activeWindow = activeWindow,
-              let cgEvent = event.cgEvent else {
-            return
-        }
-
-        guard let hitElement = elementAtScreenPosition(cgEvent.location),
-              let minimizeButton = minimizeButtonElement(from: hitElement),
-              let containingWindow = containingWindow(of: minimizeButton),
-              CFEqual(containingWindow, activeWindow) else {
-            return
-        }
-
-        nilStreak = 0
-        activeWindowRect = nil
-        self.activeWindow = nil
-        minimizationGracePeriod = Date().addingTimeInterval(0.4)
-        onChange?(true)
-    }
-
-    private func elementAtScreenPosition(_ position: CGPoint) -> AXUIElement? {
-        let systemWideElement = AXUIElementCreateSystemWide()
-        var element: AXUIElement?
-        let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(position.x), Float(position.y), &element)
-        return result == .success ? element : nil
-    }
-
-    private func minimizeButtonElement(from element: AXUIElement) -> AXUIElement? {
-        var current: AXUIElement? = element
-
-        for _ in 0..<8 {
-            guard let candidate = current else { return nil }
-
-            if stringAttribute(kAXSubroleAttribute as CFString, of: candidate) == "AXMinimizeButton" {
-                return candidate
-            }
-
-            current = elementAttribute(kAXParentAttribute as CFString, of: candidate)
-        }
-
-        return nil
-    }
-
-    private func containingWindow(of element: AXUIElement) -> AXUIElement? {
-        var current: AXUIElement? = element
-
-        for _ in 0..<12 {
-            guard let candidate = current else { return nil }
-
-            if stringAttribute(kAXRoleAttribute as CFString, of: candidate) == "AXWindow" {
-                return candidate
-            }
-
-            current = elementAttribute(kAXParentAttribute as CFString, of: candidate)
-        }
-
-        return nil
-    }
-
-    private func stringAttribute(_ attribute: CFString, of element: AXUIElement) -> String? {
-        var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
-            return nil
-        }
-
-        return value as? String
-    }
-
-    private func elementAttribute(_ attribute: CFString, of element: AXUIElement) -> AXUIElement? {
-        var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
-            return nil
-        }
-
-        return (value as! AXUIElement)
-    }
-
-    private func isWindowOnScreen(_ window: AXUIElement) -> Bool {
-        guard let handle = dlopen(nil, RTLD_NOW),
-              let sym = dlsym(handle, "AXUIElementGetWindow") else {
-            return true
-        }
-
-        typealias AXUIElementGetWindowFunc = @convention(c) (AXUIElement, UnsafeMutablePointer<UInt32>) -> Int32
-        let fn = unsafeBitCast(sym, to: AXUIElementGetWindowFunc.self)
-
-        var windowID: UInt32 = 0
-        guard fn(window, &windowID) == 0 else {
-            return true
-        }
-
-        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
-        return windowList?.contains { dict in
-            (dict[kCGWindowNumber as String] as? UInt32) == windowID
-        } ?? true
-    }
-
-    @objc private func appChanged() {
-        nilStreak = 0
-        minimizationGracePeriod = nil
-        lastPolledRect = nil
-        isMoving = false
-        stableCount = 0
+    func stop() {
+        timer?.invalidate(); timer = nil
+        refreshWork?.cancel(); refreshWork = nil
+        settlingWork?.cancel(); settlingWork = nil
+        if let monitor = mouseMonitor { NSEvent.removeMonitor(monitor); mouseMonitor = nil }
+        notificationTokens.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        notificationTokens.removeAll()
+        removeObserver()
         activeWindow = nil
-        if let frontApp = NSWorkspace.shared.frontmostApplication {
-            setupAXObserver(for: frontApp)
-        }
-        poll()
     }
 
-    // MARK: - Polling
+    private func suspend() {
+        isSuspended = true
+        refreshWork?.cancel(); refreshWork = nil
+        settlingWork?.cancel(); settlingWork = nil
+        activeWindow = nil
+        onChange?()
+    }
 
-    private func poll() {
-        guard AXIsProcessTrustedWithOptions(
-            [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
-        ) else {
-            return
-        }
-
-        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
-
-        if frontApp.processIdentifier == ProcessInfo.processInfo.processIdentifier {
-            return
-        }
-
-        lastFrontApp = frontApp
-        frontAppBundleID = frontApp.bundleIdentifier
-
-        let axApp = AXUIElementCreateApplication(pid_t(frontApp.processIdentifier))
-        var value: AnyObject?
-
-        let result = AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &value)
-
-        guard result == .success, let axWindow = value else {
-            nilStreak += 1
-            if nilStreak >= nilThreshold && activeWindowRect != nil {
-                activeWindowRect = nil
-                activeWindow = nil
-                minimizationGracePeriod = nil
-                onChange?(false)
+    func scheduleRefresh(settle: Bool = false) {
+        if refreshWork == nil {
+            let work = DispatchWorkItem { [weak self] in
+                self?.refreshWork = nil
+                self?.refresh()
             }
-            return
+            refreshWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: work)
         }
-        nilStreak = 0
-        let focusedWindow = axWindow as! AXUIElement
-
-        // If the focused window is not actually visible on the current space,
-        // treat it as no active window (e.g. during a space swipe).
-        if !isWindowOnScreen(focusedWindow) {
-            if activeWindowRect != nil {
-                activeWindowRect = nil
-                activeWindow = nil
-                onChange?(true)
-            }
-            return
+        if settle {
+            settlingWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.refresh() }
+            settlingWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10, execute: work)
         }
+    }
 
-        // Check minimized first: if true, skip reading position/size entirely.
-        var minimizedValue: AnyObject?
-        let minimizedResult = AXUIElementCopyAttributeValue(focusedWindow, "AXMinimized" as CFString, &minimizedValue)
-        if minimizedResult == .success,
-           let minimized = minimizedValue as? NSNumber,
-           minimized.boolValue {
-            if activeWindowRect != nil {
-                activeWindowRect = nil
-                activeWindow = nil
-                minimizationGracePeriod = Date().addingTimeInterval(0.4)
-                onChange?(true)
-            }
-            return
-        }
-
-        var positionValue: AnyObject?
-        var sizeValue: AnyObject?
-
-        let posResult = AXUIElementCopyAttributeValue(focusedWindow, kAXPositionAttribute as CFString, &positionValue)
-        let sizeResult = AXUIElementCopyAttributeValue(focusedWindow, kAXSizeAttribute as CFString, &sizeValue)
-
-        guard posResult == .success, sizeResult == .success,
-              let posAX = positionValue, let sizeAX = sizeValue else {
-            if activeWindowRect != nil {
-                activeWindowRect = nil
-                activeWindow = nil
-                onChange?(false)
-            }
-            return
-        }
-
-        var position = CGPoint.zero
-        var size = CGSize.zero
-
-        let gotPos = AXValueGetValue(posAX as! AXValue, .cgPoint, &position)
-        let gotSize = AXValueGetValue(sizeAX as! AXValue, .cgSize, &size)
-
-        guard gotPos, gotSize else {
-            if activeWindowRect != nil {
-                activeWindowRect = nil
-                activeWindow = nil
-                onChange?(false)
-            }
-            return
-        }
-
-        let newRect = CGRect(origin: position, size: size)
-        activeWindow = focusedWindow
-
-        // Detect minimization by sudden rect collapse during animation.
-        // When a window minimizes, its AX-reported rect shrinks dramatically.
-        if let lastRect = activeWindowRect,
-           !lastRect.isEmpty,
-           newRect.width * newRect.height < lastRect.width * lastRect.height * 0.15 {
-            activeWindowRect = nil
+    func refresh() {
+        hasPermission = AXIsProcessTrusted()
+        guard !isSuspended, isTrackingEnabled, hasPermission else {
             activeWindow = nil
-            minimizationGracePeriod = Date().addingTimeInterval(0.4)
-            onChange?(true)
+            onChange?()
             return
         }
-
-        // Grace period: after detecting minimization, ignore any rect "recoveries"
-        // caused by unstable AX data during the animation.
-        if let until = minimizationGracePeriod, Date() < until {
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            activeWindow = nil; onChange?(); return
+        }
+        let dictionaries = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        windows = dictionaries.compactMap(WindowInfo.init(dictionary:)).filter { !ignoredWindowIDs.contains($0.id) }
+        isFullscreen = false
+        if app.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            let own = NSApp.keyWindow ?? NSApp.mainWindow
+            if let ownWindow = own.flatMap({ key in windows.first { $0.id == CGWindowID(key.windowNumber) } }) {
+                activeWindow = ownWindow
+                frontAppBundleID = app.bundleIdentifier
+                frontAppName = "Shade"
+            } else if let previous = lastExternalFocus {
+                // A high-level popover is not an ordinary focus target. Keep the
+                // desktop preview live without accidentally targeting our panel.
+                activeWindow = windows.first { $0.id == previous.id }
+                frontAppBundleID = previous.bundleID
+                frontAppName = previous.name
+                isFullscreen = previous.fullscreen
+            } else { activeWindow = nil }
+            onChange?()
             return
         }
-        minimizationGracePeriod = nil
-
-        // Movement detection: hide mask while window is being dragged/resized.
-        if !isMoving {
-            if let last = lastPolledRect,
-               (abs(newRect.origin.x - last.origin.x) > moveThreshold ||
-                abs(newRect.origin.y - last.origin.y) > moveThreshold ||
-                abs(newRect.width - last.width) > moveThreshold ||
-                abs(newRect.height - last.height) > moveThreshold) {
-                isMoving = true
-                stableCount = 0
-            }
+        frontAppBundleID = app.bundleIdentifier
+        frontAppName = app.localizedName ?? "当前应用"
+        if observedPID != app.processIdentifier { observe(app: app) }
+        guard let axApp = observedApp,
+              let focused = element(kAXFocusedWindowAttribute, of: axApp) else {
+            observe(window: nil)
+            lastExternalFocus = nil
+            activeWindow = nil; onChange?(); return
+        }
+        observe(window: focused)
+        if bool(kAXMinimizedAttribute, of: focused) {
+            lastExternalFocus = nil
+            activeWindow = nil; onChange?(); return
+        }
+        isFullscreen = bool("AXFullScreen", of: focused)
+        // AX and Quartz geometries are sampled at different instants. Once the
+        // AX identity is known, use its CG ID so dragging never drops the target.
+        let bounds = resolvedWindowID == nil ? frame(of: focused) : nil
+        activeWindow = WindowSelection.resolve(pid: app.processIdentifier, frame: bounds,
+                                                knownWindowID: resolvedWindowID, windows: windows)
+        if let active = activeWindow {
+            resolvedWindowID = active.id
+            lastExternalFocus = (active.id, frontAppBundleID, frontAppName, isFullscreen)
         } else {
-            if let last = lastPolledRect, newRect.equalTo(last) {
-                stableCount += 1
-            } else {
-                stableCount = 0
-            }
-
-            if stableCount >= stableThreshold {
-                isMoving = false
-                stableCount = 0
-            }
+            // Some apps replace a CG backing surface without replacing their AX
+            // element. Hide now, then allow a fresh geometry match next time.
+            resolvedWindowID = nil
+            lastExternalFocus = nil
         }
-        lastPolledRect = newRect
+        onChange?()
+    }
 
-        if isMoving {
-            if activeWindowRect != nil {
-                activeWindowRect = nil
-                onChange?(true)
-            }
-            return
+    private func observe(app: NSRunningApplication) {
+        removeObserver()
+        observedPID = app.processIdentifier
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(axApp, 0.08)
+        observedApp = axApp
+        var value: AXObserver?
+        let callback: AXObserverCallback = { _, _, _, context in
+            guard let context = context else { return }
+            let watcher = Unmanaged<WindowWatcher>.fromOpaque(context).takeUnretainedValue()
+            watcher.scheduleRefresh()
         }
+        guard AXObserverCreate(app.processIdentifier, callback, &value) == .success, let value = value else { return }
+        observer = value
+        for name in [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification, kAXWindowCreatedNotification] {
+            AXObserverAddNotification(value, axApp, name as CFString, Unmanaged.passUnretained(self).toOpaque())
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(value), .commonModes)
+    }
 
-        if activeWindowRect == nil || !newRect.equalTo(activeWindowRect!) {
-            activeWindowRect = newRect
-            onChange?(false)
+    private func observe(window: AXUIElement?) {
+        if let old = observedWindow, let new = window, CFEqual(old, new) { return }
+        if let old = observedWindow, let observer = observer {
+            for name in windowNotifications { AXObserverRemoveNotification(observer, old, name as CFString) }
+        }
+        resolvedWindowID = nil
+        observedWindow = window
+        if let window = window, let observer = observer {
+            AXUIElementSetMessagingTimeout(window, 0.08)
+            for name in windowNotifications {
+                AXObserverAddNotification(observer, window, name as CFString, Unmanaged.passUnretained(self).toOpaque())
+            }
         }
     }
+
+    private func removeObserver() {
+        observe(window: nil)
+        if let observer = observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        observer = nil; observedApp = nil; observedPID = nil
+    }
+
+    private func value(_ name: String, of element: AXUIElement) -> CFTypeRef? {
+        var result: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &result) == .success else { return nil }
+        return result
+    }
+    private func element(_ name: String, of target: AXUIElement) -> AXUIElement? {
+        guard let result = value(name, of: target), CFGetTypeID(result) == AXUIElementGetTypeID() else { return nil }
+        return (result as! AXUIElement)
+    }
+    private func bool(_ name: String, of target: AXUIElement) -> Bool { (value(name, of: target) as? NSNumber)?.boolValue ?? false }
+    private func frame(of target: AXUIElement) -> CGRect? {
+        guard let position = value(kAXPositionAttribute, of: target), CFGetTypeID(position) == AXValueGetTypeID(),
+              let size = value(kAXSizeAttribute, of: target), CFGetTypeID(size) == AXValueGetTypeID() else { return nil }
+        var point = CGPoint.zero
+        var dimensions = CGSize.zero
+        guard AXValueGetValue(position as! AXValue, .cgPoint, &point),
+              AXValueGetValue(size as! AXValue, .cgSize, &dimensions) else { return nil }
+        return CGRect(origin: point, size: dimensions)
+    }
+
+    deinit { stop() }
 }

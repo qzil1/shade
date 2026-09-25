@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "Shade",
+            exclude: ["Info.plist", "AppIcon.icns"],
             swiftSettings: [
                 .unsafeFlags([
                     "-Xlinker", "-sectcreate",
